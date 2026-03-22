@@ -1,41 +1,33 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-/**
- * useMediaStream
- *
- * Acquires a local media stream with noise suppression and echo cancellation.
- * Exposes controls to toggle mic/camera and replace tracks on the stream.
- */
 const useMediaStream = (initialMic = true, initialVideo = true) => {
-  const streamRef = useRef(null);
-  const [stream,     setStream]     = useState(null);
-  const [isMicOn,    setIsMicOn]    = useState(initialMic);
-  const [isVideoOn,  setIsVideoOn]  = useState(initialVideo);
-  const [error,      setError]      = useState(null);
-  const [isReady,    setIsReady]    = useState(false);
+  const streamRef     = useRef(null);
+  const videoTrackRef = useRef(null);
+  const audioTrackRef = useRef(null);
 
-  // Acquire media on mount
+  const [stream,    setStream]    = useState(null);
+  const [isMicOn,   setIsMicOn]   = useState(initialMic);
+  const [isVideoOn, setIsVideoOn] = useState(initialVideo);
+  const [isReady,   setIsReady]   = useState(false);
+  const [error,     setError]     = useState(null);
+
   useEffect(() => {
     let active = true;
 
     const acquire = async () => {
       try {
         const s = await navigator.mediaDevices.getUserMedia({
-          video: initialVideo
-            ? { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }
-            : false,
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         });
 
         if (!active) { s.getTracks().forEach((t) => t.stop()); return; }
 
-        // Apply initial toggle states
-        s.getAudioTracks().forEach((t) => { t.enabled = initialMic; });
-        s.getVideoTracks().forEach((t) => { t.enabled = initialVideo; });
+        const vTrack = s.getVideoTracks()[0];
+        const aTrack = s.getAudioTracks()[0];
+
+        if (vTrack) { vTrack.enabled = initialVideo; videoTrackRef.current = vTrack; }
+        if (aTrack) { aTrack.enabled = initialMic;   audioTrackRef.current = aTrack; }
 
         streamRef.current = s;
         setStream(s);
@@ -44,7 +36,22 @@ const useMediaStream = (initialMic = true, initialVideo = true) => {
         if (!active) return;
         console.error("[useMediaStream]", err);
         setError(err.message);
-        setIsReady(true); // Still mark ready so UI can render
+
+        // Try audio-only fallback
+        try {
+          const audioOnly = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+            video: false,
+          });
+          if (!active) { audioOnly.getTracks().forEach((t) => t.stop()); return; }
+          const aTrack = audioOnly.getAudioTracks()[0];
+          if (aTrack) { aTrack.enabled = initialMic; audioTrackRef.current = aTrack; }
+          streamRef.current = audioOnly;
+          setStream(audioOnly);
+          setIsVideoOn(false);
+        } catch (_) {}
+
+        setIsReady(true);
       }
     };
 
@@ -53,67 +60,72 @@ const useMediaStream = (initialMic = true, initialVideo = true) => {
     return () => {
       active = false;
       streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current  = null;
+      videoTrackRef.current = null;
+      audioTrackRef.current = null;
     };
   }, []);
 
+  // Toggle mic ONLY — never touches video
   const toggleMic = useCallback(() => {
-    const tracks = streamRef.current?.getAudioTracks() ?? [];
+    const track = audioTrackRef.current || streamRef.current?.getAudioTracks()[0];
     const next = !isMicOn;
-    tracks.forEach((t) => { t.enabled = next; });
+    if (track) track.enabled = next;
     setIsMicOn(next);
     return next;
   }, [isMicOn]);
 
+  // Toggle video ONLY — never touches audio
   const toggleVideo = useCallback(async () => {
     const next = !isVideoOn;
 
     if (!next) {
-      // Turn camera off — just disable the track
-      streamRef.current?.getVideoTracks().forEach((t) => { t.enabled = false; });
+      // Turn OFF — disable video track only
+      const track = videoTrackRef.current || streamRef.current?.getVideoTracks()[0];
+      if (track) {
+        track.enabled = false;
+        videoTrackRef.current = track;
+      }
       setIsVideoOn(false);
       return { isVideoOn: false, newTrack: null };
     }
 
-    // Turn camera on — re-enable existing track if present
-    const existing = streamRef.current?.getVideoTracks()[0];
-    if (existing) {
+    // Turn ON — try re-enabling existing track first
+    const existing = videoTrackRef.current || streamRef.current?.getVideoTracks()[0];
+    if (existing && existing.readyState !== "ended") {
       existing.enabled = true;
+      videoTrackRef.current = existing;
       setIsVideoOn(true);
       return { isVideoOn: true, newTrack: existing };
     }
 
-    // Otherwise acquire a new video track and add to existing stream
+    // Track ended — acquire a new one
     try {
       const newStream = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
       });
       const newTrack = newStream.getVideoTracks()[0];
       streamRef.current?.addTrack(newTrack);
-      setStream(streamRef.current); // Trigger re-render
+      videoTrackRef.current = newTrack;
+      setStream(streamRef.current);
       setIsVideoOn(true);
       return { isVideoOn: true, newTrack };
     } catch (err) {
-      console.error("[toggleVideo] could not acquire camera:", err);
+      console.error("[toggleVideo] failed:", err);
+      setIsVideoOn(false);
       return { isVideoOn: false, newTrack: null };
     }
   }, [isVideoOn]);
 
+  // Force mute audio only — used by host controls
   const forceMute = useCallback(() => {
-    streamRef.current?.getAudioTracks().forEach((t) => { t.enabled = false; });
+    const track = audioTrackRef.current || streamRef.current?.getAudioTracks()[0];
+    if (track) track.enabled = false;
     setIsMicOn(false);
   }, []);
 
-  return {
-    stream,
-    streamRef,
-    isMicOn,
-    isVideoOn,
-    error,
-    isReady,
-    toggleMic,
-    toggleVideo,
-    forceMute,
-  };
+  return { stream, streamRef, isMicOn, isVideoOn, error, isReady, toggleMic, toggleVideo, forceMute };
 };
 
 export default useMediaStream;
